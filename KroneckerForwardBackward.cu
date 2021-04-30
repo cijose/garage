@@ -19,7 +19,7 @@
  *  along with selector.  If not, see <http://www.gnu.org/licenses/>.
  *
  */
-
+// nvcc KroneckerForwardBackward.cu -ccbin=g++-4.9  -std=c++11 -lcublas -o KroneckerForwardBackward.bin
 
 #include <iostream>
 #include <cstdlib>
