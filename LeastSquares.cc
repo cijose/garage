@@ -137,7 +137,7 @@ void printVector(const real *x, int d) {
   std::cout << std::endl;
 }
 int main() {
-  int numPoints = 10;
+  int numPoints = 100;
   int dimension = 25;
   real *X = new real[numPoints * dimension];
   real *y = new real[numPoints];
