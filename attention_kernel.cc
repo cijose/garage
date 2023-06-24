@@ -92,28 +92,6 @@ void vectorized_softmax(int m, int n, real *x) {
   ns = sequence length
   nd = head dimension
 */
-void attention_kernel_naive(size_t nb, size_t ns, size_t nh, size_t nd,
-                            const real *wq, const real *wk, const real *wv,
-                            real *cache, real *output) {
-
-  real alpha = real(1) / sqrt(real(nd));
-  for (int i = 0; i < nb; i++) {
-    for (int j = 0; j < nh; j++) {
-      const real *vt = wv + i * (nh * ns * nd) + j * (ns * nd);
-      for (int k = 0; k < ns; k++) {
-        const real *qt = wq + i * (nh * ns * nd) + j * (ns * nd) + k * (nd);
-        for (int l = 0; l < ns; l++) {
-          const real *kt = wk + i * (nh * ns * nd) + j * (ns * nd) + l * (nd);
-          cache[l] = dot(nd, qt, kt) * alpha;
-        }
-        softmax(ns, cache);
-        real *ot = output + i * (nh * ns * nd) + j * (ns * nd) + k * (nd);
-        gemv(CblasTrans, ns, nd, 1.0f, vt, cache, 0.f, ot);
-      }
-    }
-  }
-}
-
 void attention_kernel_gemm_thread_block(size_t nb, size_t ns, size_t nh,
                                         size_t nd, size_t th_block_start,
                                         size_t th_block_end, const real *wq,
@@ -199,7 +177,6 @@ int main() {
   real *cache = new real[num_threads * ns * ns];
   real *output0 = new real[size];
   real *output1 = new real[size];
-  real *output2 = new real[size];
   for (int i = 0; i < size; i++) {
     k[i] = std_randn();
     q[i] = std_randn();
@@ -209,19 +186,8 @@ int main() {
 
   for (int i = 0; i < num_reps; i++) {
     double start = dclock();
-    attention_kernel_naive(nb, ns, nh, nd, q, k, v, cache, output0);
-    elapsed += dclock() - start;
-  }
-  elapsed /= num_reps;
-  printf("Time taken to compute attention of %zu batches of %zu sequences with "
-         "%zu heads in %zu head dimension is %f seconds\n",
-         nb, ns, nh, nd, elapsed);
-
-  elapsed = 0;
-  for (int i = 0; i < num_reps; i++) {
-    double start = dclock();
     attention_kernel_gemm_thread_block(nb, ns, nh, nd, 0, nb * nh, q, k, v,
-                                       cache, output1);
+                                       cache, output0);
     elapsed += dclock() - start;
   }
   elapsed /= num_reps;
@@ -230,9 +196,6 @@ int main() {
          "%zu heads in %zu head dimension is %f seconds\n",
          nb, ns, nh, nd, elapsed);
 
-  for (int i = 0; i < size; i++) {
-    assert(abs(output0[i] - output1[i]) < 1e-5);
-  }
   size_t thread_block_size = nb * nh / num_threads;
   elapsed = 0;
   for (int i = 0; i < num_reps; i++) {
@@ -244,7 +207,7 @@ int main() {
       threads.push_back(std::thread(attention_kernel_gemm_thread_block, nb, ns,
                                     nh, nd, thread_block_start,
                                     thread_block_end, q, k, v,
-                                    cache + th * ns * ns, output2));
+                                    cache + th * ns * ns, output1));
       thread_block_start = thread_block_end;
       thread_block_end += thread_block_size;
     }
@@ -261,7 +224,7 @@ int main() {
          nb, ns, nh, nd, elapsed);
 
   for (int i = 0; i < size; i++) {
-    assert(abs(output1[i] - output2[i]) < 1e-5);
+    assert(abs(output0[i] - output1[i]) < 1e-5);
   }
   delete[] k;
   delete[] q;
@@ -270,5 +233,4 @@ int main() {
   delete[] cache;
   delete[] output0;
   delete[] output1;
-  delete[] output2;
 }
