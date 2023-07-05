@@ -86,6 +86,40 @@ void vectorized_softmax(int m, int n, real *x) {
   }
 }
 
+void naive_attention(size_t ns, size_t nd, real alpha, const real *wq,
+                     const real *wk, const real *wv, real *cache,
+                     real *output) {
+
+  gemm(CblasNoTrans, CblasTrans, ns, ns, nd, alpha, wq, wk, 0.f, cache);
+  vectorized_softmax(ns, ns, cache);
+  gemm(CblasNoTrans, CblasNoTrans, ns, nd, ns, 1.f, cache, wv, 0.f, output);
+}
+
+void flash_attention(size_t ns, size_t nd, real alpha, const real *wq,
+                     const real *wk, const real *wv, real *cache,
+                     real *output) {}
+
+void attention_kernel_gemm_thread_block0(
+    size_t nb, size_t ns, size_t nh, size_t nd, size_t th_block_start,
+    size_t th_block_end, size_t num_inner_blocks, const real *wq,
+    const real *wk, const real *wv, real *cache, real *output) {
+
+  real alpha = real(1) / sqrt(real(nd));
+  size_t inner_block_size = ns * nd / num_inner_blocks;
+  size_t nsk = ns / num_inner_blocks;
+  for (int i = th_block_start; i < th_block_end; i++) {
+    const real *vt = wv + i * (ns * nd);
+    const real *kt = wk + i * (ns * nd);
+    for (int k = 0; k < num_inner_blocks; k++) {
+      const real *qt = wq + i * (ns * nd) + k * inner_block_size;
+      gemm(CblasNoTrans, CblasTrans, nsk, ns, nd, alpha, qt, kt, 0.f, cache);
+      vectorized_softmax(nsk, ns, cache);
+      real *ot = output + i * (ns * nd) + k * inner_block_size;
+      gemm(CblasNoTrans, CblasNoTrans, nsk, nd, ns, 1.f, cache, vt, 0.f, ot);
+    }
+  }
+}
+
 /* q, k, v are row major ordered as nb * nh * ns * nd
   nb = batch size
   nh = num heads
@@ -150,8 +184,8 @@ void test() {
       -0.090629, 0.349120, -0.716471, 0.869136, -0.777030, 0.815258,
       1.763403,  0.348928, -0.854486, 0.817642, 1.765924,  0.327799};
 
-  attention_kernel_gemm_thread_block(nb, ns, nh, nd, 0, nb * nh, q, k, v, cache,
-                                     output);
+  attention_kernel_gemm_thread_block0(nb, ns, nh, nd, 0, nb * nh, 1, q, k, v,
+                                      cache, output);
   for (int i = 0; i < size; i++) {
     assert(abs(expected_output[i] - output[i]) < 1e-6);
   }
@@ -170,7 +204,9 @@ int main() {
 
   size_t size = nb * nh * ns * nd;
 
-  size_t num_threads = 8;
+  size_t num_threads = 32;
+  size_t num_inner_blocks = 1;
+  size_t nsb = ns / num_inner_blocks;
   real *k = new real[size];
   real *q = new real[size];
   real *v = new real[size];
@@ -186,8 +222,8 @@ int main() {
 
   for (int i = 0; i < num_reps; i++) {
     double start = dclock();
-    attention_kernel_gemm_thread_block(nb, ns, nh, nd, 0, nb * nh, q, k, v,
-                                       cache, output0);
+    attention_kernel_gemm_thread_block0(
+        nb, ns, nh, nd, 0, nb * nh, num_inner_blocks, q, k, v, cache, output0);
     elapsed += dclock() - start;
   }
   elapsed /= num_reps;
@@ -204,9 +240,9 @@ int main() {
     size_t thread_block_start = 0;
     size_t thread_block_end = thread_block_size;
     for (int th = 0; th < num_threads; th++) {
-      threads.push_back(std::thread(attention_kernel_gemm_thread_block, nb, ns,
+      threads.push_back(std::thread(attention_kernel_gemm_thread_block0, nb, ns,
                                     nh, nd, thread_block_start,
-                                    thread_block_end, q, k, v,
+                                    thread_block_end, num_inner_blocks, q, k, v,
                                     cache + th * ns * ns, output1));
       thread_block_start = thread_block_end;
       thread_block_end += thread_block_size;
