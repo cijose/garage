@@ -1,7 +1,7 @@
 
 #include <Accelerate/Accelerate.h>
 #include <assert.h>
-#include <limits>
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -9,7 +9,8 @@
 #include <time.h>
 
 // On Apple
-//clang++ flash_attention.cc -framework Accelerate  -o flash_attention -std=c++11 -fPIC  -O3
+// clang flash_attention.cc -framework Accelerate  -o flash_attention
+//  -fPIC  -O3
 
 static double gtod_ref_time_sec = 0.0;
 
@@ -32,32 +33,14 @@ double dclock() {
   return the_time;
 }
 
-void gemm(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB, int m,
-          int n, int k, const float alpha, const float *x, const float *y,
-          const float beta, float *z) {
+void gemm(const enum CBLAS_TRANSPOSE TransA, const enum CBLAS_TRANSPOSE TransB,
+          int m, int n, int k, const float alpha, const float *x,
+          const float *y, const float beta, float *z) {
   int lda = (TransA == CblasNoTrans) ? k : m;
   int ldb = (TransB == CblasNoTrans) ? n : k;
   cblas_sgemm(CblasRowMajor, TransA, TransB, m, n, k, alpha, x, lda, y, ldb,
               beta, z, n);
 }
-
-void gemv(const CBLAS_TRANSPOSE TransA, int m, int n, const float alpha,
-          const float *a, const float *x, const float beta, float *y) {
-  cblas_sgemv(CblasRowMajor, TransA, m, n, alpha, a, n, x, 1, beta, y, 1);
-}
-
-void axpy(int n, const float alpha, const float *x, float *y) {
-  cblas_saxpy(n, alpha, x, 1, y, 1);
-}
-
-void copy(int n, const float *x, float *y) { cblas_scopy(n, x, 1, y, 1); }
-
-void scale(int n, const float alpha, float *x) { cblas_sscal(n, alpha, x, 1); }
-float dot(int n, const float *x, const float *y) {
-  return cblas_sdot(n, x, 1, y, 1);
-}
-
-float norm(int n, const float *x) { return cblas_snrm2(n, x, 1); }
 
 void softmax(size_t n, size_t d, float *x) {
 #pragma omp parallel for
@@ -81,8 +64,8 @@ void softmax(size_t n, size_t d, float *x) {
   }
 }
 
-inline int min(int a, int b) { return (a) < (b) ? a : b; }
-inline int max(int a, int b) { return (a) > (b) ? a : b; }
+// inline int min(int a, int b) { return (a) < (b) ? a : b; }
+// inline int max(int a, int b) { return (a) > (b) ? a : b; }
 void row_max(int m, int n, const float *a, float *b) {
   for (int i = 0; i < m; i++) {
     b[i] = a[i * n];
@@ -93,7 +76,6 @@ void row_max(int m, int n, const float *a, float *b) {
 }
 
 void row_sum(int m, int n, const float *a, float *b) {
-//#pragma omp parallel for
   for (int i = 0; i < m; i++) {
     b[i] = a[i * n];
     for (int j = 1; j < n; j++) {
@@ -103,7 +85,6 @@ void row_sum(int m, int n, const float *a, float *b) {
 }
 
 void stable_exp(int m, int n, const float *rmax, const float *a, float *b) {
-//#pragma omp parallel for
   for (int i = 0; i < m * n; i++) {
     b[i] = exp(a[i] - rmax[i / n]);
   }
@@ -112,7 +93,7 @@ void stable_exp(int m, int n, const float *rmax, const float *a, float *b) {
 void black_magic(int br, int bc, int d, const float *vj, const float *pij,
                  const float *mij, const float *lij, float *li, float *mi,
                  float *pijvj, float *oi) {
-  
+
   for (int i = 0; i < br; i++) {
     for (int p = 0; p < bc; p++) {
       for (int j = 0; j < d; j++) {
@@ -137,24 +118,25 @@ void flash_attention(int n, int d, int cache_line_size, const float *q,
 
   // int bc = ceil(float(cache_line_size) / float(4 * d));
   // int br = min(ceil(float(cache_line_size) / float(4 * d)), d);
-  int br = 64;
-  int bc = 128;
+  int br = d;
+  int bc = 2 * d;
   memset(o, 0, sizeof(float) * n * d);
 
-  int tr = ceil(float(n) / float(br));
-  int tc = ceil(float(n) / float(bc));
+  int tr = ceil((float)(n) / (float)(br));
+  int tc = ceil((float)(n) / (float)(bc));
   size_t memory_size = 2 * n + br * bc + 2 * br + d;
   float *l = (float *)malloc(sizeof(float) * (memory_size));
   float *c = l + n;
   memset(l, 0, sizeof(float) * memory_size);
   for (int i = 0; i < n; i++) {
-    c[i] = -std::numeric_limits<float>::infinity();
+    c[i] = FLT_MIN;
   }
-/*
-  printf("memory size = %zu, naive memeory_size = %d, memory_saved = %f, tc = "
-         "%d, br = %d bc = %d\n",
-         memory_size, n * n, float(n * n) / float(memory_size), tc, bc, br);
-*/
+  /*
+    printf("memory size = %zu, naive memeory_size = %d, memory_saved = %f, tc =
+    "
+           "%d, br = %d bc = %d\n",
+           memory_size, n * n, float(n * n) / float(memory_size), tc, bc, br);
+  */
   float *sij = c + n;
   float *pij = sij;
   float *mij = sij + br * bc;
@@ -205,9 +187,9 @@ void test() {
   size_t m = 8 * d;
 
   size_t size = n * d;
-  float *k = new float[size];
-  float *q = new float[size];
-  float *v = new float[size];
+  float *k = (float *)malloc(sizeof(float) * size);
+  float *q = (float *)malloc(sizeof(float) * size);
+  float *v = (float *)malloc(sizeof(float) * size);
   for (int i = 0; i < size; i++) {
     k[i] = std_randn();
     q[i] = std_randn();
@@ -230,7 +212,7 @@ void test() {
   double elapsed_time_flash = end_time - start_time;
   for (int i = 0; i < size; i++) {
     //    printf("%d : %f : %f\n", i, o_naive[i], o_flash[i]);
-    assert(abs(o_naive[i] - o_flash[i]) < 1e-3);
+    assert(fabsf(o_naive[i] - o_flash[i]) < 1e-3);
   }
   printf("Time taken to compute flash attention of %zu sequences with %zu "
          "dimension is %f seconds\n",
