@@ -64,8 +64,6 @@ void softmax(size_t n, size_t d, float *x) {
   }
 }
 
-// inline int min(int a, int b) { return (a) < (b) ? a : b; }
-// inline int max(int a, int b) { return (a) > (b) ? a : b; }
 void row_max(int m, int n, const float *a, float *b) {
   for (int i = 0; i < m; i++) {
     b[i] = a[i * n];
@@ -84,61 +82,44 @@ void row_sum(int m, int n, const float *a, float *b) {
   }
 }
 
-void stable_exp(int m, int n, const float *rmax, const float *a, float *b) {
+void stable_exp(int m, int n, const float *rmax, float *a) {
   for (int i = 0; i < m * n; i++) {
-    b[i] = exp(a[i] - rmax[i / n]);
+    a[i] = exp(a[i] - rmax[i / n]);
   }
 }
 
 void black_magic(int br, int bc, int d, const float *vj, const float *pij,
                  const float *mij, const float *lij, float *li, float *mi,
                  float *pijvj, float *oi) {
-
+  gemm(CblasNoTrans, CblasNoTrans, br, d, bc, 1.0f, pij, vj, 0.f, pijvj);
   for (int i = 0; i < br; i++) {
-    for (int p = 0; p < bc; p++) {
-      for (int j = 0; j < d; j++) {
-        pijvj[j] += pij[i * bc + p] * vj[p * d + j];
-      }
-    }
     float mi_new = max(mi[i], mij[i]);
-    float li_new = exp(mi[i] - mi_new) * li[i] + exp(mij[i] - mi_new) * lij[i];
-    for (int j = 0; j < d; j++) {
-      oi[i * d + j] = (li[i] * exp(mi[i] - mi_new) * oi[i * d + j] +
-                       exp(mij[i] - mi_new) * pijvj[j]) /
-                      li_new;
-      pijvj[j] = 0;
-    }
+    float a = li[i] * exp(mi[i] - mi_new);
+    float b = exp(mij[i] - mi_new);
+    float li_new = a + b * lij[i];
     li[i] = li_new;
     mi[i] = mi_new;
+    a /= li_new;
+    b /= li_new;
+    for (int j = 0; j < d; j++) {
+      oi[i * d + j] = a * oi[i * d + j] + b * pijvj[i * d + j];
+    }
   }
 }
 
-void flash_attention(int n, int d, int cache_line_size, const float *q,
-                     const float *k, const float *v, float *o) {
+void flash_attention(int n, int d, int br, int bc, const float *q,
+                     const float *k, const float *v, float *cache, float *o) {
 
-  // int bc = ceil(float(cache_line_size) / float(4 * d));
-  // int br = min(ceil(float(cache_line_size) / float(4 * d)), d);
-  int br = d;
-  int bc = 2 * d;
-  memset(o, 0, sizeof(float) * n * d);
-
+  size_t flash_memory_size = 2 * n + br * bc + 2 * br + br * d;
   int tr = ceil((float)(n) / (float)(br));
   int tc = ceil((float)(n) / (float)(bc));
-  size_t memory_size = 2 * n + br * bc + 2 * br + d;
-  float *l = (float *)malloc(sizeof(float) * (memory_size));
-  float *c = l + n;
-  memset(l, 0, sizeof(float) * memory_size);
+  memset(o, 0, sizeof(float) * n * d);
+  memset(cache, 0, sizeof(float) * flash_memory_size);
+  float *c = cache + n;
   for (int i = 0; i < n; i++) {
     c[i] = FLT_MIN;
   }
-  /*
-    printf("memory size = %zu, naive memeory_size = %d, memory_saved = %f, tc =
-    "
-           "%d, br = %d bc = %d\n",
-           memory_size, n * n, float(n * n) / float(memory_size), tc, bc, br);
-  */
   float *sij = c + n;
-  float *pij = sij;
   float *mij = sij + br * bc;
   float *lij = mij + br;
   float *pijvj = lij + br;
@@ -148,16 +129,15 @@ void flash_attention(int n, int d, int cache_line_size, const float *q,
     for (int i = 0; i < tr; i++) {
       const float *qi = q + i * (br * d);
       float *oi = o + i * (br * d);
-      float *li = l + i * br;
+      float *li = cache + i * br;
       float *ci = c + i * br;
       gemm(CblasNoTrans, CblasTrans, br, bc, d, 1.0f, qi, kj, 0.f, sij);
       row_max(br, bc, sij, mij);
-      stable_exp(br, bc, mij, sij, pij);
-      row_sum(br, bc, pij, lij);
-      black_magic(br, bc, d, vj, pij, mij, lij, li, ci, pijvj, oi);
+      stable_exp(br, bc, mij, sij);
+      row_sum(br, bc, sij, lij);
+      black_magic(br, bc, d, vj, sij, mij, lij, li, ci, pijvj, oi);
     }
   }
-  free(l);
 }
 
 void naive_attention(int n, int d, const float *q, const float *k,
@@ -206,8 +186,17 @@ void test() {
          "dimension is %f seconds\n",
          n, d, elapsed_time_naive);
 
+  int br = d;
+  int bc = 2 * d;
+  size_t flash_memory_size = 2 * n + br * bc + 2 * br + br * d;
+  float *cache = (float *)malloc(sizeof(float) * (flash_memory_size));
+  float memory_saved = (float)(n * n) / (float)(flash_memory_size);
+  printf(
+      "memory size = %zu, naive memeory_size = %zu, memory_saved = %fx, br = "
+      "%d bc = %d\n",
+      flash_memory_size, n * n, memory_saved, br, bc);
   start_time = dclock();
-  flash_attention(n, d, m, q, k, v, o_flash);
+  flash_attention(n, d, br, bc, q, k, v, cache, o_flash);
   end_time = dclock();
   double elapsed_time_flash = end_time - start_time;
   for (int i = 0; i < size; i++) {
@@ -218,13 +207,15 @@ void test() {
          "dimension is %f seconds\n",
          n, d, elapsed_time_flash);
 
-  printf("Flash attention is %f slower than naive attenion\n",
-         elapsed_time_flash / elapsed_time_naive);
+  printf("Flash attention is %f slower than naive attenion but uses %f less "
+         "memory\n",
+         elapsed_time_flash / elapsed_time_naive, memory_saved);
   free(o_naive);
   free(o_flash);
   free(q);
   free(k);
   free(v);
+  free(cache);
 }
 int main() {
   test();
