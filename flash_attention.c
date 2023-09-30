@@ -17,6 +17,7 @@ static double gtod_ref_time_sec = 0.0;
 /* Adapted from the bl2_clock() routine in the BLIS library */
 
 inline float max(float a, float b) { return (a) > (b) ? a : b; }
+
 double dclock() {
   double the_time, norm_sec;
   struct timeval tv;
@@ -66,25 +67,29 @@ void softmax(size_t n, size_t d, float *x) {
 
 void row_max(int m, int n, const float *a, float *b) {
   for (int i = 0; i < m; i++) {
-    b[i] = a[i * n];
-    for (int j = 1; j < n; j++) {
-      b[i] = max(b[i], a[i * n + j]);
-    }
+    vDSP_maxv(a + i * n, 1, &b[i], n);
   }
 }
 
 void row_sum(int m, int n, const float *a, float *b) {
   for (int i = 0; i < m; i++) {
-    b[i] = a[i * n];
-    for (int j = 1; j < n; j++) {
-      b[i] += a[i * n + j];
-    }
+    vDSP_sve(a + i * n, 1, &b[i], n);
   }
 }
-
 void stable_exp(int m, int n, const float *rmax, float *a) {
   for (int i = 0; i < m * n; i++) {
     a[i] = exp(a[i] - rmax[i / n]);
+  }
+}
+
+void row_max_exp_row_sum(int m, int n, float *a, float *b, float *c) {
+  for (int i = 0; i < m; i++) {
+    vDSP_maxv(a + i * n, 1, &b[i], n);
+    b[i] = -b[i];
+    vDSP_vsadd(a + i * n, 1, &b[i], a + i * n, 1, n);
+    b[i] = -b[i];
+    vvexpf(a + i * n, a + i * n, &n);
+    vDSP_sve(a + i * n, 1, &c[i], n);
   }
 }
 
@@ -101,9 +106,7 @@ void black_magic(int br, int bc, int d, const float *vj, const float *pij,
     mi[i] = mi_new;
     a /= li_new;
     b /= li_new;
-    for (int j = 0; j < d; j++) {
-      oi[i * d + j] = a * oi[i * d + j] + b * pijvj[i * d + j];
-    }
+    vDSP_vsmsma(oi + i * d, 1, &a, pijvj + i * d, 1, &b, oi + i * d, 1, d);
   }
 }
 
@@ -128,14 +131,10 @@ void flash_attention(int n, int d, int br, int bc, const float *q,
     const float *vj = v + j * (bc * d);
     for (int i = 0; i < tr; i++) {
       const float *qi = q + i * (br * d);
-      float *oi = o + i * (br * d);
-      float *li = cache + i * br;
-      float *ci = c + i * br;
       gemm(CblasNoTrans, CblasTrans, br, bc, d, 1.0f, qi, kj, 0.f, sij);
-      row_max(br, bc, sij, mij);
-      stable_exp(br, bc, mij, sij);
-      row_sum(br, bc, sij, lij);
-      black_magic(br, bc, d, vj, sij, mij, lij, li, ci, pijvj, oi);
+      row_max_exp_row_sum(br, bc, sij, mij, lij);
+      black_magic(br, bc, d, vj, sij, mij, lij, cache + i * br, c + i * br,
+                  pijvj, o + i * (br * d));
     }
   }
 }
@@ -167,6 +166,7 @@ void test() {
   size_t m = 8 * d;
 
   size_t size = n * d;
+  size_t num_exp = 50;
   float *k = (float *)malloc(sizeof(float) * size);
   float *q = (float *)malloc(sizeof(float) * size);
   float *v = (float *)malloc(sizeof(float) * size);
@@ -178,16 +178,19 @@ void test() {
 
   float *o_naive = (float *)malloc(sizeof(float) * n * d);
   float *o_flash = (float *)malloc(sizeof(float) * n * d);
-  double start_time = dclock();
-  naive_attention(n, d, q, k, v, o_naive);
-  double end_time = dclock();
-  double elapsed_time_naive = end_time - start_time;
+  double elapsed_time_naive = 0;
+  for (int i = 0; i < num_exp; i++) {
+    double start_time = dclock();
+    naive_attention(n, d, q, k, v, o_naive);
+    double end_time = dclock();
+    elapsed_time_naive += end_time - start_time;
+  }
   printf("Time taken to compute naive attention of %zu sequences with %zu "
          "dimension is %f seconds\n",
-         n, d, elapsed_time_naive);
+         n, d, elapsed_time_naive / (float)num_exp);
 
   int br = d;
-  int bc = 2 * d;
+  int bc = d;
   size_t flash_memory_size = 2 * n + br * bc + 2 * br + br * d;
   float *cache = (float *)malloc(sizeof(float) * (flash_memory_size));
   float memory_saved = (float)(n * n) / (float)(flash_memory_size);
@@ -195,21 +198,24 @@ void test() {
       "memory size = %zu, naive memeory_size = %zu, memory_saved = %fx, br = "
       "%d bc = %d\n",
       flash_memory_size, n * n, memory_saved, br, bc);
-  start_time = dclock();
-  flash_attention(n, d, br, bc, q, k, v, cache, o_flash);
-  end_time = dclock();
-  double elapsed_time_flash = end_time - start_time;
+  double elapsed_time_flash = 0;
+  for (int i = 0; i < num_exp; i++) {
+    double start_time = dclock();
+    flash_attention(n, d, br, bc, q, k, v, cache, o_flash);
+    double end_time = dclock();
+    elapsed_time_flash += end_time - start_time;
+  }
   for (int i = 0; i < size; i++) {
     //    printf("%d : %f : %f\n", i, o_naive[i], o_flash[i]);
     assert(fabsf(o_naive[i] - o_flash[i]) < 1e-3);
   }
   printf("Time taken to compute flash attention of %zu sequences with %zu "
          "dimension is %f seconds\n",
-         n, d, elapsed_time_flash);
+         n, d, elapsed_time_flash / (float)num_exp);
 
-  printf("Flash attention is %f slower than naive attenion but uses %f less "
+  printf("Flash attention is %f faster than naive attenion and uses %f less "
          "memory\n",
-         elapsed_time_flash / elapsed_time_naive, memory_saved);
+         elapsed_time_naive / elapsed_time_flash, memory_saved);
   free(o_naive);
   free(o_flash);
   free(q);
