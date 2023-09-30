@@ -65,23 +65,6 @@ void softmax(size_t n, size_t d, float *x) {
   }
 }
 
-void row_max(int m, int n, const float *a, float *b) {
-  for (int i = 0; i < m; i++) {
-    vDSP_maxv(a + i * n, 1, &b[i], n);
-  }
-}
-
-void row_sum(int m, int n, const float *a, float *b) {
-  for (int i = 0; i < m; i++) {
-    vDSP_sve(a + i * n, 1, &b[i], n);
-  }
-}
-void stable_exp(int m, int n, const float *rmax, float *a) {
-  for (int i = 0; i < m * n; i++) {
-    a[i] = exp(a[i] - rmax[i / n]);
-  }
-}
-
 void row_max_exp_row_sum(int m, int n, float *a, float *b, float *c) {
   for (int i = 0; i < m; i++) {
     vDSP_maxv(a + i * n, 1, &b[i], n);
@@ -140,14 +123,12 @@ void flash_attention(int n, int d, int br, int bc, const float *q,
 }
 
 void naive_attention(int n, int d, const float *q, const float *k,
-                     const float *v, float *o) {
+                     const float *v, float *cache, float *o) {
 
   memset(o, 0, sizeof(float) * n * d);
-  float *sqkt = (float *)malloc(sizeof(float) * n * n);
-  gemm(CblasNoTrans, CblasTrans, n, n, d, 1.0f, q, k, 0.f, sqkt);
-  softmax(n, n, sqkt);
-  gemm(CblasNoTrans, CblasNoTrans, n, d, n, 1.0f, sqkt, v, 0.f, o);
-  free(sqkt);
+  gemm(CblasNoTrans, CblasTrans, n, n, d, 1.0f, q, k, 0.f, cache);
+  softmax(n, n, cache);
+  gemm(CblasNoTrans, CblasNoTrans, n, d, n, 1.0f, cache, v, 0.f, o);
 }
 float std_randn() {
   float u = ((float)rand() / (RAND_MAX)) * 2 - 1;
@@ -178,10 +159,11 @@ void test() {
 
   float *o_naive = (float *)malloc(sizeof(float) * n * d);
   float *o_flash = (float *)malloc(sizeof(float) * n * d);
+  float *sqkt = (float *)malloc(sizeof(float) * n * n);
   double elapsed_time_naive = 0;
   for (int i = 0; i < num_exp; i++) {
     double start_time = dclock();
-    naive_attention(n, d, q, k, v, o_naive);
+    naive_attention(n, d, q, k, v, sqkt, o_naive);
     double end_time = dclock();
     elapsed_time_naive += end_time - start_time;
   }
@@ -194,10 +176,11 @@ void test() {
   size_t flash_memory_size = 2 * n + br * bc + 2 * br + br * d;
   float *cache = (float *)malloc(sizeof(float) * (flash_memory_size));
   float memory_saved = (float)(n * n) / (float)(flash_memory_size);
-  printf(
-      "memory size = %zu, naive memeory_size = %zu, memory_saved = %fx, br = "
-      "%d bc = %d\n",
-      flash_memory_size, n * n, memory_saved, br, bc);
+  printf("memory size = %zu bytes, naive memeory_size = %zu bytes, "
+         "memory_saved = %fx, br = "
+         "%d bc = %d\n",
+         flash_memory_size * sizeof(float), n * n * sizeof(float), memory_saved,
+         br, bc);
   double elapsed_time_flash = 0;
   for (int i = 0; i < num_exp; i++) {
     double start_time = dclock();
@@ -221,6 +204,7 @@ void test() {
   free(q);
   free(k);
   free(v);
+  free(sqkt);
   free(cache);
 }
 int main() {
