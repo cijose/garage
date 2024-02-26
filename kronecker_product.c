@@ -5,6 +5,12 @@
 #include <cstring>
 #include <iostream>
 #include <vector>
+typedef struct KroneckerProduct {
+    int num_factors_;
+    int factor_sizes_;
+    float *values_;
+
+};
 
 void cpu_kronecker_forward_kernel(int M, int N, int rowk, int colk, int stride,
                                   const float *W_k, const float *X, float *Y) {
